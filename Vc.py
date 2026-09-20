@@ -156,11 +156,12 @@ def _start_kb():
     return InlineKeyboardMarkup(
         [
             [InlineKeyboardButton("➕ Add Me To Your Group", url=f"https://t.me/{BOT_UN}?startgroup=true")],
-            _support_row(),
             [
+                InlineKeyboardButton("🔗 Attach Group", callback_data="mygroups"),
                 InlineKeyboardButton("📖 Commands", callback_data="cmds"),
-                InlineKeyboardButton("👑 Owner", url=OWNER_LINK),
             ],
+            _support_row(),
+            [InlineKeyboardButton("👑 Owner", url=OWNER_LINK)],
         ]
     )
 
@@ -205,6 +206,70 @@ CMDS_TEXT = (
     "  👥 /addsession • /sessions • /delsession\n"
     "  ✅ /approve • /unapprove • /approved\n"
 )
+
+
+@bot.on_callback_query(filters.regex("^mygroups$"))
+async def mygroups_cb(_, cb: CallbackQuery):
+    uid = cb.from_user.id
+    if not is_allowed(uid):
+        return await cb.answer("Not approved", show_alert=True)
+    await cb.answer("Loading groups...")
+    buttons = []
+    seen = set()
+    try:
+        async for d in userbot.get_dialogs(limit=60):
+            ch = d.chat
+            if (
+                ch and ch.type in (enums.ChatType.GROUP, enums.ChatType.SUPERGROUP)
+                and ch.id not in seen and len(buttons) < 15
+            ):
+                seen.add(ch.id)
+                buttons.append(
+                    [InlineKeyboardButton(
+                        f"🔗 {(ch.title or 'Group')[:24]}",
+                        callback_data=f"selg:{ch.id}"
+                    )]
+                )
+    except Exception:
+        pass
+    if not buttons:
+        return await cb.message.edit_text(
+            "❌ Assistant kisi group me nahi hai.\n"
+            "Group ka link bhejo, ya assistant account ko group me add karo.",
+            reply_markup=_back_kb()
+        )
+    buttons.append([InlineKeyboardButton("⬅ Back", callback_data="backstart")])
+    await cb.message.edit_text(
+        "🔗 **Attach Group**\n\n"
+        "Apna group tap karo — link bhejne ki zaroorat nahi 🚀",
+        reply_markup=InlineKeyboardMarkup(buttons)
+    )
+
+
+@bot.on_callback_query(filters.regex(r"^selg:(-?\d+)$"))
+async def selg_cb(_, cb: CallbackQuery):
+    uid = cb.from_user.id
+    if not is_allowed(uid):
+        return await cb.answer("Not approved", show_alert=True)
+    chat_id = int(cb.matches[0].group(1))
+    try:
+        chat = await userbot.get_chat(chat_id)
+        gname = chat.title or str(chat_id)
+    except Exception:
+        gname = CHAT_NAMES.get(chat_id, str(chat_id))
+    user_data[uid] = {
+        "step": "audio",
+        "group": gname,
+        "chat_id": chat_id,
+        "invite": True
+    }
+    LAST_CHAT[uid] = chat_id
+    CHAT_NAMES[chat_id] = gname
+    await cb.message.edit_text(
+        f"✅ **Group attached:** {gname}\n\n"
+        "🎵 Ab audio ya video file bhejo — turant play hoga"
+    )
+    await cb.answer("Attached! 🎵")
 
 
 @bot.on_callback_query(filters.regex("^cmds$"))
@@ -377,7 +442,7 @@ def _save_mute_flag():
 
 
 MUTE_FLAG = _load_mute_flag()  # chats jahan assistant MIC OFF badge ke saath join hoga
-MUTED_MUSIC = os.getenv("MUTED_MUSIC", "1") == "1"  # music ke waqt bhi mic OFF dikhe
+MUTED_MUSIC = os.getenv("MUTED_MUSIC", "0") == "1"  # 1 = music ke waqt bhi mic OFF (no sound on some servers)
 
 
 def _save_sessions():
@@ -1156,8 +1221,8 @@ async def media_handler(_, m: Message):
         user_data[uid]["audio"] = file_path
         user_data[uid]["kind"] = "video" if is_video else "audio"
         LAST_CHAT[uid] = chat_id
-        CHAT_NAMES[chat_id] = grp
         grp = user_data[uid]["group"]
+        CHAT_NAMES[chat_id] = grp
         icon = "🎬" if is_video else "🎵"
         base = os.path.basename(file_path)[:30]
         await msg.edit_text(
