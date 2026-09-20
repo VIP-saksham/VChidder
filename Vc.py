@@ -31,6 +31,9 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 API_ID = int(os.getenv("API_ID") or 0)
 API_HASH = os.getenv("API_HASH", "").strip()
 SESSION_STRING = os.getenv("SESSION_STRING", "").strip()
+# assistant (player) accounts can run under a custom app identity (e.g. WeBGram)
+ASSISTANT_API_ID = int(os.getenv("ASSISTANT_API_ID") or 0) or API_ID
+ASSISTANT_API_HASH = os.getenv("ASSISTANT_API_HASH", "").strip() or API_HASH
 OWNER_ID = int(os.getenv("OWNER_ID") or 0)
 SUDO_IDS = {
     int(x)
@@ -116,8 +119,8 @@ bot = Client(
 
 userbot = Client(
     "vc_userbot",
-    api_id=API_ID,
-    api_hash=API_HASH,
+    api_id=ASSISTANT_API_ID,
+    api_hash=ASSISTANT_API_HASH,
     session_string=SESSION_STRING
 )
 
@@ -462,8 +465,8 @@ async def _start_assistant(session, idx, live=False):
     """Naya assistant client + PyTgCalls engine start karta hai. Returns (name, c, tc)."""
     c = Client(
         f"vchidder_assist_{idx}_{int(time.time())}",
-        api_id=API_ID,
-        api_hash=API_HASH,
+        api_id=ASSISTANT_API_ID,
+        api_hash=ASSISTANT_API_HASH,
         session_string=session,
         in_memory=True
     )
