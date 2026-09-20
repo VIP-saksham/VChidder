@@ -86,10 +86,6 @@ BOT_UN = ""
 pending_requests = set()  # users who asked for access (dedupe)
 
 
-def is_owner(uid):
-    return uid == OWNER_ID
-
-
 def is_admin(uid):
     return uid == OWNER_ID or uid in SUDO_IDS
 
@@ -445,7 +441,6 @@ def _save_mute_flag():
 
 
 MUTE_FLAG = _load_mute_flag()  # chats jahan assistant MIC OFF badge ke saath join hoga
-MUTED_MUSIC = os.getenv("MUTED_MUSIC", "0") == "1"  # 1 = music ke waqt bhi mic OFF (no sound on some servers)
 
 
 def _save_sessions():
@@ -461,10 +456,10 @@ def _save_sessions():
         print("sessions save failed:", e)
 
 
-async def _start_assistant(session, idx, live=False):
+async def _start_assistant(session, idx):
     """Naya assistant client + PyTgCalls engine start karta hai. Returns (name, c, tc)."""
     c = Client(
-        f"vchidder_assist_{idx}_{int(time.time())}",
+        f"vchidder_assist_{idx}",
         api_id=ASSISTANT_API_ID,
         api_hash=ASSISTANT_API_HASH,
         session_string=session,
@@ -507,7 +502,7 @@ async def _ensure_assistant_member(idx, chat_id):
 async def _restore_mic(chat_id):
     """Stop ke baad presence wapas chalu karta hai (jitne assistants joined the)."""
     await asyncio.sleep(2)
-    if chat_id in set(active_calls.values()):
+    if chat_id in active_calls.values():
         return
     # presence = muted badge (file patch join ke waqt padhta hai)
     MUTE_FLAG.add(chat_id)
@@ -527,7 +522,7 @@ async def _mic_keepalive_worker():
     while True:
         await asyncio.sleep(MIC_REFRESH)
         for (chat_id, idx) in list(PRESENCE_JOINED):
-            if idx == 0 and chat_id in set(active_calls.values()):
+            if idx == 0 and chat_id in active_calls.values():
                 continue  # primary pe real music chal raha hai
             try:
                 tc = ASSISTANTS[idx][2]
@@ -768,16 +763,16 @@ async def mic_toggle(_, m: Message):
                 ok.append(ASSISTANTS[idx][0])
             except Exception as e:
                 fail.append(f"{ASSISTANTS[idx][0]}: {str(e)[:60]}")
-        txt = (                "🎙 **Presence ON!** (Mic OFF badge)\n\n"
-                f"📻 Group: {gname}\n"
-                f"👻 Joined ({len(ok)}/{len(ASSISTANTS)}):\n"
-                + "\n".join(f"  • {n}" for n in ok)
-                + "\n\n🔇 Sab VC me honge par MIC OFF dikhenge\n"
-                f"♻️ Auto-refresh har {MIC_REFRESH // 60} min me"
+        txt = (
+            "🎙 **Presence ON!** (Mic OFF badge)\n\n"
+            f"📻 Group: {gname}\n"
+            f"👻 Joined ({len(ok)}/{len(ASSISTANTS)}):\n"
+            + "\n".join(f"  • {n}" for n in ok)
+            + "\n\n🔇 Sab VC me honge par MIC OFF dikhenge\n"
+            f"♻️ Auto-refresh har {MIC_REFRESH // 60} min me"
         )
         if fail:
             txt += "\n\n⚠️ Failed:\n" + "\n".join(f"  • {n}" for n in fail)
-        txt += f"\n\n♻️ Auto-refresh har {MIC_REFRESH // 60} min me"
         await m.reply_text(txt)
         await send_log(
             "🎙 **Mic ON**\n\n"
@@ -808,7 +803,7 @@ async def mic_toggle(_, m: Message):
 
 # ---------------- /ac active-calls panel ----------------
 
-def _ac_kb(uid):
+def _ac_kb():
     """Active calls panel ke live buttons."""
     rows = []
     for cid, idx in sorted(PRESENCE_JOINED):
@@ -819,7 +814,7 @@ def _ac_kb(uid):
                 callback_data=f"acoff:{cid}:{idx}"
             )]
         )
-    rows.append([InlineKeyboardButton("🔴 Refresh", callback_data=f"acview:{uid}")])
+    rows.append([InlineKeyboardButton("🔴 Refresh", callback_data="acview")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -835,11 +830,11 @@ async def ac_cmd(_, m: Message):
     lines = [f"🎙 **Active Mic/Presence ({len(PRESENCE_JOINED)}):**\n"]
     for cid, idx in sorted(PRESENCE_JOINED):
         name = CHAT_NAMES.get(cid) or str(cid)
-        playing = "🎵 music" if (idx == 0 and cid in set(active_calls.values())) else "mic only"
+        playing = "🎵 music" if (idx == 0 and cid in active_calls.values()) else "mic only"
         lines.append(f"  • {name} → asst #{idx} ({playing})")
     await m.reply_text(
         "\n".join(lines) + "\n\n⬇️ Button dabao = OFF",
-        reply_markup=_ac_kb(m.from_user.id)
+        reply_markup=_ac_kb()
     )
 
 
@@ -866,21 +861,21 @@ async def ac_off_cb(_, cb: CallbackQuery):
     )
     if PRESENCE_JOINED:
         try:
-            await cb.message.edit_reply_markup(reply_markup=_ac_kb(cb.from_user.id))
+            await cb.message.edit_reply_markup(reply_markup=_ac_kb())
         except Exception:
             pass
     else:
         await cb.message.edit_text("📴 Sab presence OFF ho gayi")
 
 
-@bot.on_callback_query(filters.regex(r"^acview:(\d+)$"))
+@bot.on_callback_query(filters.regex(r"^acview$"))
 async def ac_view_cb(_, cb: CallbackQuery):
     if not is_admin(cb.from_user.id):
         return await cb.answer("Owner only", show_alert=True)
     if not PRESENCE_JOINED:
         return await cb.message.edit_text("📴 Sab presence OFF ho gayi")
     try:
-        await cb.message.edit_reply_markup(reply_markup=_ac_kb(cb.from_user.id))
+        await cb.message.edit_reply_markup(reply_markup=_ac_kb())
         await cb.answer("Refreshed")
     except Exception:
         await cb.answer("No change")
@@ -905,7 +900,7 @@ async def addsession_cmd(_, m: Message):
     wait = await m.reply_text("⏳ Logging in new assistant...")
     try:
         idx = len(ASSISTANTS)
-        name, c, tc = await _start_assistant(session, idx, live=True)
+        name, c, tc = await _start_assistant(session, idx)
     except Exception as e:
         return await wait.edit_text(f"❌ Login failed (invalid session?):\n`{str(e)[:150]}`")
     ASSISTANTS.append((name, c, tc))
@@ -1210,10 +1205,9 @@ async def media_handler(_, m: Message):
         file_path = await m.download("downloads/")
         await msg.edit_text("🎙 Joining voice chat...")
         chat_id = await _resolve_chat_id(uid)
-        # Elitegram-ref: mic badge = server muted flag; audio ssrc par phir bhi jata hai
-        if not MUTED_MUSIC:
-            MUTE_FLAG.discard(chat_id)
-            _save_mute_flag()
+        # sound-first: music hamesha unmuted join (muted join par server audio forward nahi karta)
+        MUTE_FLAG.discard(chat_id)
+        _save_mute_flag()
         await calls.play(chat_id, MediaStream(file_path))
         old = active_calls.get(uid)
         if old and old != chat_id:
@@ -1254,9 +1248,8 @@ async def replay(_, cb: CallbackQuery):
         return await cb.answer("File missing — dobara bhejo", show_alert=True)
     try:
         chat_id = active_calls[uid]
-        if not MUTED_MUSIC:
-            MUTE_FLAG.discard(chat_id)
-            _save_mute_flag()
+        MUTE_FLAG.discard(chat_id)
+        _save_mute_flag()
         await calls.play(chat_id, MediaStream(path))
         paused_calls.discard(chat_id)
         await cb.answer("⟲ Replaying")
