@@ -451,11 +451,13 @@ async def _start_assistant(session, idx):
 
 
 async def _ensure_assistant_member(idx, chat_id):
-    """Extra assistant group ka member nahi -> invite hash/username se join karao."""
+    """Extra assistant member nahi -> invite se join karao.
+    Request-approval group ho to join request bhejo + watcher laga do.
+    Returns True (member) / False (request pending ya fail)."""
     name, c, tc = ASSISTANTS[idx]
     try:
         await c.get_chat(chat_id)
-        return  # already member
+        return True  # already member
     except Exception:
         pass
     h = INVITE_HASH.get(chat_id)
@@ -463,16 +465,65 @@ async def _ensure_assistant_member(idx, chat_id):
         try:
             await c.invoke(raw_functions.messages.ImportChatInvite(hash=h))
             await asyncio.sleep(1.5)
-            return
-        except Exception:
-            pass  # already participant?
+            return True
+        except Exception as e:
+            if "REQUEST_SENT" in str(e):
+                # approval-required group — request gayi, approved hote hi VC join
+                _start_request_watcher(chat_id, idx)
+                return False
+            try:
+                await c.get_chat(chat_id)
+                return True  # already participant
+            except Exception:
+                return False
     try:
         ch = await userbot.get_chat(chat_id)
         if getattr(ch, "username", None):
             await c.join_chat(ch.username)
             await asyncio.sleep(1.5)
+            return True
     except Exception:
         pass
+    return False
+
+
+REQUEST_PENDING = set()   # (chat_id, idx) — join request bheja hua, approval ka intezaar
+
+
+def _start_request_watcher(chat_id, idx):
+    if (chat_id, idx) not in REQUEST_PENDING:
+        REQUEST_PENDING.add((chat_id, idx))
+        asyncio.ensure_future(_request_watcher(chat_id, idx))
+
+
+async def _request_watcher(chat_id, idx):
+    """Join-request wale private groups: approval hote hi assistant VC me chadega (mode ke hisab se)."""
+    try:
+        for _ in range(1080):          # ~6 ghante tak poll
+            await asyncio.sleep(20)
+            if (chat_id, idx) not in REQUEST_PENDING:
+                return
+            h = INVITE_HASH.get(chat_id)
+            if not h:
+                return
+            try:
+                inv = await userbot.invoke(raw_functions.messages.CheckChatInvite(hash=h))
+            except Exception:
+                continue
+            if isinstance(inv, (raw_types.ChatInviteAlready, raw_types.ChatInvitePeek)):
+                break
+        else:
+            return
+        await asyncio.sleep(1.5)       # membership settle
+        mode = QUEUE_META.get(chat_id, {}).get("mode", MODE_SINGLE)
+        cur = QUEUE_META.get(chat_id, {}).get("current")
+        media = cur.get("path") if (cur and mode == MODE_ALL) else None
+        if await _assistant_join(chat_id, idx, media=media):
+            print(f"✅ join request approved — asst#{idx} VC joined chat={chat_id} (mode={mode})")
+    except Exception as e:
+        print("request watcher error:", str(e)[:120])
+    finally:
+        REQUEST_PENDING.discard((chat_id, idx))
 
 
 async def _assistant_join(chat_id, idx, media=None):
@@ -713,7 +764,10 @@ async def _play_with_failover(chat_id, entry, mode):
             continue
         try:
             if idx > 0:
-                await _ensure_assistant_member(idx, chat_id)
+                if not await _ensure_assistant_member(idx, chat_id):
+                    last = f"asst#{idx} — group join request pending, approval ka intezaar ⏳"
+                    print("play blocked:", last)
+                    continue
             await eng.play(chat_id, MediaStream(entry["path"]))
             return idx
         except Exception as e:
@@ -739,7 +793,9 @@ async def _all_in_one_audio(chat_id, path):
         if eng is None:
             continue
         try:
-            await _ensure_assistant_member(idx, chat_id)
+            if not await _ensure_assistant_member(idx, chat_id):
+                print(f"all-in-one asst#{idx}: join request pending ⏳")
+                continue
             await eng.play(chat_id, MediaStream(path))
             PRESENCE_JOINED.add((chat_id, idx))
             meta["eng"] = idx   # last started engine = active (controls isko target karein)
@@ -2120,7 +2176,9 @@ async def addsession_cmd(_, m: Message):
     if len(m.command) > 1:
         session = m.command[1].strip()
     elif m.reply_to_message and m.reply_to_message.text:
-        session = m.reply_to_message.text.strip().split()[0]
+        toks = [t.strip("`") for t in m.reply_to_message.text.strip().split()]
+        if toks:
+            session = max(toks, key=len)  # session string = sabse lamba token
     if not session:
         return await m.reply_text(
             "Usage:\n`/addsession <session_string>`\n"
