@@ -189,30 +189,41 @@ def _save_sessions():
 
 # ---------------- keyboards ----------------
 
-def _buttons(paused=False):
+def _buttons(paused=False, chat_id=0):
+    loop_on = QUEUE_META.get(chat_id, {}).get("loop")
+
+    def cb(action):
+        return f"pb:{chat_id}:{action}"
+
     return InlineKeyboardMarkup(
         [
             [
-                InlineKeyboardButton("⏮ Replay", callback_data="replay"),
+                InlineKeyboardButton("⏮ Replay", callback_data=cb("replay")),
                 InlineKeyboardButton(
                     "⏯ Resume" if paused else "⏯ Pause",
-                    callback_data="resume" if paused else "pause"
+                    callback_data=cb("resume" if paused else "pause")
                 ),
-                InlineKeyboardButton("⏹ Stop", callback_data="stop"),
-                InlineKeyboardButton("⏭ Skip", callback_data="skip"),
-                InlineKeyboardButton("🎚 Vol", callback_data="volmenu"),
+                InlineKeyboardButton("⏹ Stop", callback_data=cb("stop")),
             ],
-            _support_row(),
+            [
+                InlineKeyboardButton("⏭ Skip", callback_data=cb("skip")),
+                InlineKeyboardButton(
+                    "🔁 Loop ✅" if loop_on else "🔁 Loop",
+                    callback_data=cb("loop")
+                ),
+                InlineKeyboardButton("🎚 Vol", callback_data=cb("vol")),
+            ],
+            [InlineKeyboardButton("👥 Mode", callback_data=cb("mode"))] + _support_row(),
         ]
     )
 
 
 def _vol_kb(chat_id):
     row1, row2 = [], []
-    for i, (name, _) in enumerate(VOLUME_LEVELS.items()):
+    for i, name in enumerate(VOLUME_LEVELS):
         btn = InlineKeyboardButton(
             f"{name} ✅" if _chat_vol(chat_id) == name else name,
-            callback_data=f"volset:{name}"
+            callback_data=f"vs:{chat_id}:{name}"
         )
         (row1 if i < 3 else row2).append(btn)
     return InlineKeyboardMarkup([row1, row2])
@@ -249,12 +260,12 @@ def _back_kb():
     )
 
 
-def _mode_kb():
+def _mode_kb(chat_id=0):
     return InlineKeyboardMarkup(
         [
-            [InlineKeyboardButton("1️⃣ Single Assistant", callback_data=f"mode:{MODE_SINGLE}")],
-            [InlineKeyboardButton("2️⃣ One By One", callback_data=f"mode:{MODE_ONBYONE}")],
-            [InlineKeyboardButton("3️⃣ All In One", callback_data=f"mode:{MODE_ALL}")],
+            [InlineKeyboardButton("1️⃣ Solo — sirf main assistant", callback_data=f"mset:{chat_id}:{MODE_SINGLE}")],
+            [InlineKeyboardButton("2️⃣ One By One — failover", callback_data=f"mset:{chat_id}:{MODE_ONBYONE}")],
+            [InlineKeyboardButton("3️⃣ All In One — sab sath", callback_data=f"mset:{chat_id}:{MODE_ALL}")],
         ]
     )
 
@@ -566,7 +577,8 @@ async def _queue_worker(chat_id):
             entry = q.popleft()
             # signal HAMESHA fresh reset ke sath — warna worker wait nahi karta (premature-left bug)
             sig = WAIT_END.setdefault(chat_id, _EndSignal())
-            eng_idx = await _play_with_failover(chat_id, entry, meta.get("mode", MODE_SINGLE))
+            mode = meta.get("mode", MODE_SINGLE)
+            eng_idx = await _play_with_failover(chat_id, entry, mode)
             if eng_idx is None:
                 _drop_entry(entry)
                 continue
@@ -579,15 +591,9 @@ async def _queue_worker(chat_id):
             chat_calls[chat_id] = entry["uid"]
             asyncio.ensure_future(_apply_volume(chat_id))
 
-            # assistant mode ke hisab se extra presence
-            mode = meta.get("mode", MODE_SINGLE)
-            if mode == MODE_ONBYONE and len(ASSISTANTS) > 1:
-                standby = eng_idx + 1
-                if standby < len(ASSISTANTS):
-                    await _assistant_join(chat_id, standby)
-            elif mode == MODE_ALL:
-                for idx in range(1, len(ASSISTANTS)):
-                    await _assistant_join(chat_id, idx)
+            # All-In-One: sab assistants ek sath REAL audio bajayenge (sab se voice)
+            if mode == MODE_ALL:
+                asyncio.ensure_future(_all_in_one_audio(chat_id, entry["path"]))
 
             icon = "🎬" if entry["kind"] == "video" else "🎵"
             pos = meta.get("pos", 1)
@@ -605,7 +611,7 @@ async def _queue_worker(chat_id):
                     ) + "\n"
                     "  🎭 Mode: Anonymous\n"
                     "╰────────────────────────────╯",
-                    reply_markup=_buttons(),
+                    reply_markup=_buttons(paused=False, chat_id=chat_id),
                 )
             except Exception:
                 pass
@@ -622,6 +628,32 @@ async def _queue_worker(chat_id):
                 await asyncio.wait_for(sig.ev.wait(), timeout=3600 * 6)
             except asyncio.TimeoutError:
                 pass
+            # One-By-One: track band/mute hua -> wahi track NEXT assistant ko handover
+            # (nested wait — queue khali ho to bhi handover-stream pura chale)
+            while (mode == MODE_ONBYONE and eng_idx + 1 < len(ASSISTANTS)
+                   and not meta.get("stop")):
+                nxt = eng_idx + 1
+                try:
+                    await _ensure_assistant_member(nxt, chat_id)
+                    await _engine_by_idx(nxt).play(chat_id, MediaStream(entry["path"]))
+                except Exception:
+                    break
+                old_idx = eng_idx
+                meta["eng"] = eng_idx = nxt
+                PRESENCE_JOINED.discard((chat_id, old_idx))
+                try:
+                    await _engine_by_idx(old_idx).leave_call(chat_id)
+                except Exception:
+                    pass
+                sig.reset()
+                try:
+                    await asyncio.wait_for(sig.ev.wait(), timeout=3600 * 6)
+                except asyncio.TimeoutError:
+                    pass
+            if meta.get("loop") and not meta.get("stop"):
+                QUEUES.setdefault(chat_id, deque()).append(entry)  # wahi track wapas queue me
+                meta["current"] = None
+                continue
             if meta.get("stop"):
                 break
             _drop_entry(entry)
@@ -668,7 +700,12 @@ def _chat_engine(chat_id):
 async def _play_with_failover(chat_id, entry, mode):
     """Stream start karo. One-By-One me primary fail -> next assistants try karo.
     Returns engine idx jo stream chala raha, ya None (sab fail)."""
-    order = list(range(len(ASSISTANTS))) if mode == MODE_ONBYONE else [0]
+    if mode == MODE_ONBYONE:
+        order = list(range(len(ASSISTANTS)))
+    elif mode == MODE_ALL:
+        order = [0, 1] if len(ASSISTANTS) > 1 else [0]
+    else:
+        order = [0]
     last = ""
     for idx in order:
         eng = _engine_by_idx(idx)
@@ -691,6 +728,22 @@ async def _play_with_failover(chat_id, entry, mode):
         except Exception:
             pass
     return None
+
+
+async def _all_in_one_audio(chat_id, path):
+    """All-In-One: baaki assistants bhi same file same time bajayenge (sab se voice)."""
+    await asyncio.sleep(2.5)   # primary ka stream pehle settle ho jaye
+    for idx in range(1, len(ASSISTANTS)):
+        eng = _engine_by_idx(idx)
+        if eng is None:
+            continue
+        try:
+            await _ensure_assistant_member(idx, chat_id)
+            await eng.play(chat_id, MediaStream(path))
+            PRESENCE_JOINED.add((chat_id, idx))
+            await asyncio.sleep(1)
+        except Exception as e:
+            print(f"all-in-one asst#{idx} fail:", str(e)[:100])
 
 
 def _enqueue(chat_id, entry):
@@ -1244,13 +1297,13 @@ def _queue_view(chat_id):
     for i in range(n - 1):
         kb.append([InlineKeyboardButton(
             f"🔄 #{i + 1} ⇄ #{i + 2}",
-            callback_data=f"swap:{i}:{i + 1}"
+            callback_data=f"sw:{chat_id}:{i}:{i + 1}"
         )])
     row = []
     if cur:
-        row.append(InlineKeyboardButton("⏭ Skip Current", callback_data="skip"))
+        row.append(InlineKeyboardButton("⏭ Skip Current", callback_data=f"pb:{chat_id}:skip"))
     if n:
-        row.append(InlineKeyboardButton("♻ Refresh", callback_data="qview"))
+        row.append(InlineKeyboardButton("♻ Refresh", callback_data=f"qb:{chat_id}"))
     if row:
         kb.append(row)
     kb.append(_support_row())
@@ -1339,23 +1392,6 @@ async def vol_menu_cb(_, cb: CallbackQuery):
     await cb.answer()
 
 
-@bot.on_callback_query(filters.regex(r"^volset:([\w ]+)$"))
-async def vol_set_cb(_, cb: CallbackQuery):
-    if not is_allowed(cb.from_user.id):
-        return await cb.answer("Not approved", show_alert=True)
-    chat_id = cb.message.chat.id
-    name = cb.matches[0].group(1)
-    if name not in VOLUME_LEVELS:
-        return await cb.answer("Unknown level", show_alert=True)
-    QUEUE_META.setdefault(chat_id, {})["vol"] = name
-    await _apply_volume(chat_id)
-    await cb.answer(f"🔊 {name} ({VOLUME_LEVELS[name]}%)", show_alert=True)
-    try:
-        await cb.message.edit_reply_markup(reply_markup=_vol_kb(chat_id))
-    except Exception:
-        pass
-
-
 # ---------------- stream end hook ----------------
 
 @calls.on_update()
@@ -1404,38 +1440,119 @@ async def stop_cmd(_, m: Message):
     )
 
 
-@bot.on_callback_query(filters.regex("^stop$"))
-async def stop_cb(_, cb: CallbackQuery):
+@bot.on_callback_query(filters.regex(r"^pb:(-?\d+):(\w+)$"))
+async def player_cb(_, cb: CallbackQuery):
+    """Player buttons — chat-id embedded (PM se bhi sahi group control hoga)."""
     uid = cb.from_user.id
     if not is_allowed(uid):
         return await cb.answer("Not approved", show_alert=True)
-    chat_id = cb.message.chat.id
-    if chat_id not in WAIT_END and not QUEUES.get(chat_id):
-        return await cb.answer("Nothing playing", show_alert=True)
-    _clear_queue(chat_id)
-    active_calls.pop(uid, None)
-    await cb.message.edit_text("⏹ Voice Chat Stopped")
-    await cb.answer("Stopped")
+    chat_id = int(cb.matches[0].group(1))
+    action = cb.matches[0].group(2)
+    meta = QUEUE_META.get(chat_id, {})
+    cur = meta.get("current")
+    eng = _chat_engine(chat_id)
+
+    if action == "replay":
+        if not cur or not os.path.exists(cur["path"]):
+            return await cb.answer("File missing — dobara bhejo", show_alert=True)
+        try:
+            await eng.play(chat_id, MediaStream(cur["path"]))
+            paused_calls.discard(chat_id)
+        except Exception as e:
+            return await cb.answer(f"Error: {e}", show_alert=True)
+        return await cb.answer("⟲ Replaying")
+
+    if action in ("pause", "resume"):
+        if chat_id not in WAIT_END:
+            return await cb.answer("Nothing playing", show_alert=True)
+        try:
+            if action == "pause":
+                await eng.pause(chat_id)
+                paused_calls.add(chat_id)
+            else:
+                await eng.resume(chat_id)
+                paused_calls.discard(chat_id)
+            try:
+                await cb.message.edit_reply_markup(
+                    reply_markup=_buttons(chat_id in paused_calls, chat_id)
+                )
+            except Exception:
+                pass
+            return await cb.answer(
+                "⏸ Paused" if action == "pause" else "▶️ Resumed"
+            )
+        except Exception as e:
+            return await cb.answer(f"Error: {e}", show_alert=True)
+
+    if action == "skip":
+        sig = WAIT_END.get(chat_id)
+        if not sig:
+            return await cb.answer("Nothing playing", show_alert=True)
+        sig.set()
+        return await cb.answer("⏭ Skipped")
+
+    if action == "loop":
+        m = QUEUE_META.setdefault(chat_id, {})
+        m["loop"] = not m.get("loop")
+        try:
+            await cb.message.edit_reply_markup(
+                reply_markup=_buttons(chat_id in paused_calls, chat_id)
+            )
+        except Exception:
+            pass
+        return await cb.answer(
+            f"🔁 Loop {'ON — wahi gaana repeat hoga' if m['loop'] else 'OFF'}",
+            show_alert=True,
+        )
+
+    if action == "vol":
+        try:
+            await cb.message.reply_text(
+                f"🔊 **Volume** — abhi: **{_chat_vol(chat_id)}**\nLevel chuno:",
+                reply_markup=_vol_kb(chat_id),
+            )
+        except Exception:
+            pass
+        return await cb.answer()
+
+    if action == "mode":
+        try:
+            await cb.message.reply_text(
+                "👥 **Assistant Mode** — abhi: **"
+                + MODE_LABEL.get(meta.get("mode", MODE_SINGLE), "?") + "**\n"
+                "Naya mode chuno (turant switch hoga):",
+                reply_markup=_mode_kb(chat_id),
+            )
+        except Exception:
+            pass
+        return await cb.answer()
+
+    await cb.answer()
 
 
-@bot.on_callback_query(filters.regex("^skip$"))
-async def skip_cb(_, cb: CallbackQuery):
-    uid = cb.from_user.id
-    if not is_allowed(uid):
+@bot.on_callback_query(filters.regex(r"^vs:(-?\d+):([\w ]+)$"))
+async def vol_set_cb(_, cb: CallbackQuery):
+    if not is_allowed(cb.from_user.id):
         return await cb.answer("Not approved", show_alert=True)
-    chat_id = cb.message.chat.id
-    ev = WAIT_END.get(chat_id)
-    if not ev:
-        return await cb.answer("Nothing playing", show_alert=True)
-    ev.set()
-    await cb.answer("⏭ Skipped")
+    chat_id = int(cb.matches[0].group(1))
+    name = cb.matches[0].group(2)
+    if name not in VOLUME_LEVELS:
+        return await cb.answer("Unknown level", show_alert=True)
+    QUEUE_META.setdefault(chat_id, {})["vol"] = name
+    await _apply_volume(chat_id)
+    await cb.answer(f"🔊 {name} ({VOLUME_LEVELS[name]}%)", show_alert=True)
+    try:
+        await cb.message.edit_reply_markup(reply_markup=_vol_kb(chat_id))
+    except Exception:
+        pass
 
 
-@bot.on_callback_query(filters.regex("^qview$"))
+@bot.on_callback_query(filters.regex(r"^qb:(-?\d+)$"))
 async def qview_cb(_, cb: CallbackQuery):
     if not is_allowed(cb.from_user.id):
         return await cb.answer("Not approved", show_alert=True)
-    view = _queue_view(cb.message.chat.id)
+    chat_id = int(cb.matches[0].group(1))
+    view = _queue_view(chat_id)
     if not view:
         return await cb.answer("Queue khali", show_alert=True)
     try:
@@ -1445,13 +1562,13 @@ async def qview_cb(_, cb: CallbackQuery):
     await cb.answer()
 
 
-@bot.on_callback_query(filters.regex(r"^swap:(\d+):(\d+)$"))
+@bot.on_callback_query(filters.regex(r"^sw:(-?\d+):(\d+):(\d+)$"))
 async def swap_cb(_, cb: CallbackQuery):
     if not is_allowed(cb.from_user.id):
         return await cb.answer("Not approved", show_alert=True)
-    chat_id = cb.message.chat.id
+    chat_id = int(cb.matches[0].group(1))
     q = QUEUES.get(chat_id)
-    i, j = int(cb.matches[0].group(1)), int(cb.matches[0].group(2))
+    i, j = int(cb.matches[0].group(2)), int(cb.matches[0].group(3))
     if not q or i >= len(q) or j >= len(q):
         return await cb.answer("Positions abhi valid nahi", show_alert=True)
     q[i], q[j] = q[j], q[i]
@@ -1464,48 +1581,6 @@ async def swap_cb(_, cb: CallbackQuery):
             pass
 
 
-@bot.on_callback_query(filters.regex("^replay$"))
-async def replay(_, cb: CallbackQuery):
-    uid = cb.from_user.id
-    if not is_allowed(uid):
-        return await cb.answer("Not approved", show_alert=True)
-    chat_id = cb.message.chat.id
-    cur = QUEUE_META.get(chat_id, {}).get("current")
-    if not cur or not os.path.exists(cur["path"]):
-        return await cb.answer("File missing — dobara bhejo", show_alert=True)
-    try:
-        await _chat_engine(chat_id).play(chat_id, MediaStream(cur["path"]))
-        paused_calls.discard(chat_id)
-        await cb.answer("⟲ Replaying")
-    except Exception as e:
-        await cb.answer(f"Error: {e}", show_alert=True)
-
-
-@bot.on_callback_query(filters.regex("^(pause|resume)$"))
-async def pause_resume_cb(_, cb: CallbackQuery):
-    uid = cb.from_user.id
-    if not is_allowed(uid):
-        return await cb.answer("Not approved", show_alert=True)
-    chat_id = cb.message.chat.id
-    if chat_id not in WAIT_END:
-        return await cb.answer("Nothing playing", show_alert=True)
-    try:
-        if cb.data == "pause":
-            await calls.pause(chat_id)
-            paused_calls.add(chat_id)
-            await cb.answer("⏸ Paused")
-        else:
-            await calls.resume(chat_id)
-            paused_calls.discard(chat_id)
-            await cb.answer("▶️ Resumed")
-        try:
-            await cb.message.edit_reply_markup(
-                reply_markup=_buttons(chat_id in paused_calls)
-            )
-        except Exception:
-            pass
-    except Exception as e:
-        await cb.answer(f"Error: {e}", show_alert=True)
 
 
 # ---------------- /tts — live text-to-speech in VC ----------------
@@ -1728,7 +1803,7 @@ async def text_handler(_, m: Message):
                 return await wait.edit_text(
                     f"✅ **Group verify ho gaya:** {invite.chat.title}\n\n"
                     "👥 **Kaunsa assistant mode?**",
-                    reply_markup=_mode_kb()
+                    reply_markup=_mode_kb(marked)
                 )
 
             # CASE 2/3: joinable preview -> import the invite
@@ -1781,7 +1856,7 @@ async def text_handler(_, m: Message):
                     return await wait.edit_text(
                         f"✅ **Joined:** {gname}\n\n"
                         "👥 **Kaunsa assistant mode?**",
-                        reply_markup=_mode_kb()
+                        reply_markup=_mode_kb(marked)
                     )
                 user_data[uid] = {
                     "step": "pending",
@@ -1840,7 +1915,7 @@ async def text_handler(_, m: Message):
             "  1️⃣ Single — sirf main assistant VC me jayega\n"
             "  2️⃣ One By One — ek band to dusra jayega\n"
             "  3️⃣ All In One — teeno ek sath VC me",
-            reply_markup=_mode_kb()
+            reply_markup=_mode_kb(chat_id)
         )
     if step == "mode":
         return await m.reply_text("👥 Upar mode buttons me se chuno (1/2/3)")
@@ -1875,20 +1950,39 @@ def _finish_group_select(uid, mode, m=None):
     ))
 
 
-@bot.on_callback_query(filters.regex(r"^mode:(\d+)$"))
+async def _switch_mode(chat_id, mode):
+    """Mode live switch: presence sahi karo, All-In-One me extra audio start."""
+    meta = QUEUE_META.setdefault(chat_id, {})
+    meta["mode"] = mode
+    cur = meta.get("current")
+    if not cur or chat_id not in WAIT_END:
+        return
+    eng_idx = meta.get("eng", 0)
+    if mode == MODE_ALL:
+        asyncio.ensure_future(_all_in_one_audio(chat_id, cur["path"]))
+    elif mode in (MODE_SINGLE, MODE_ONBYONE):
+        for idx in range(1, len(ASSISTANTS)):
+            if idx != eng_idx and (chat_id, idx) in PRESENCE_JOINED:
+                await _assistant_leave(chat_id, idx)
+    if mode == MODE_ONBYONE:
+        standby = eng_idx + 1
+        if standby < len(ASSISTANTS) and (chat_id, standby) not in PRESENCE_JOINED:
+            await _assistant_join(chat_id, standby)
+
+
+@bot.on_callback_query(filters.regex(r"^mset:(-?\d+):(\d+)$"))
 async def mode_cb(_, cb: CallbackQuery):
     uid = cb.from_user.id
     if not is_allowed(uid):
         return await cb.answer("Not approved", show_alert=True)
-    mode = int(cb.matches[0].group(1))
+    chat_id = int(cb.matches[0].group(1))
+    mode = int(cb.matches[0].group(2))
     info = user_data.get(uid) or {}
-    chat_id = info.get("chat_id")
-    if not chat_id:
-        return await cb.answer("Pehle group bhejo", show_alert=True)
-    meta = QUEUE_META.setdefault(chat_id, {})
-    meta["mode"] = mode
-    info["step"] = "audio"
-    gname = info.get("group", str(chat_id))
+    await _switch_mode(chat_id, mode)
+    if info.get("step") in ("group", "mode"):
+        info["step"] = "audio"
+    gname = CHAT_NAMES.get(chat_id) or info.get("group") or str(chat_id)
+    CHAT_NAMES[chat_id] = gname
     await cb.message.edit_text(
         f"✅ **Mode set:** {MODE_LABEL[mode]}\n"
         f"📻 **Group:** {gname}\n\n"
@@ -1923,7 +2017,7 @@ async def checkjoin_cb(_, cb: CallbackQuery):
         await cb.message.edit_text(
             f"✅ **Approved & Joined:** {user_data[uid].get('group', chat_id)}\n\n"
             "👥 **Kaunsa assistant mode?**",
-            reply_markup=_mode_kb()
+            reply_markup=_mode_kb(chat_id)
         )
         await cb.answer("Joined! 🎉")
     else:

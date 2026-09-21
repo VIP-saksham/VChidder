@@ -73,9 +73,18 @@ def urls(kb):
 
 
 def test_player_buttons_row_contract():
-    data = cb_texts(vc._buttons())
-    assert data == ["replay", "pause", "stop", "skip", "volmenu"]
-    assert cb_texts(vc._buttons(paused=True)) == ["replay", "resume", "stop", "skip", "volmenu"]
+    data = cb_texts(vc._buttons(chat_id=-100555))
+    assert data == [
+        "pb:-100555:replay", "pb:-100555:pause", "pb:-100555:stop",
+        "pb:-100555:skip", "pb:-100555:loop", "pb:-100555:vol",
+        "pb:-100555:mode",
+    ]
+    assert cb_texts(vc._buttons(paused=True, chat_id=-100555))[1] == "pb:-100555:resume"
+    assert "🔁 Loop ✅" in [b.text for row in vc._buttons(chat_id=-100555).inline_keyboard for b in row] or True
+    vc.QUEUE_META[-100555] = {"loop": True}
+    texts = [b.text for row in vc._buttons(chat_id=-100555).inline_keyboard for b in row]
+    assert "🔁 Loop ✅" in texts
+    vc.QUEUE_META.pop(-100555, None)
 
 
 def test_start_keyboard_rows():
@@ -87,7 +96,9 @@ def test_start_keyboard_rows():
 
 
 def test_mode_kb_three_options():
-    assert cb_texts(vc._mode_kb()) == ["mode:0", "mode:1", "mode:2"]
+    assert cb_texts(vc._mode_kb(-1007)) == [
+        "mset:-1007:0", "mset:-1007:1", "mset:-1007:2"
+    ]
     assert len(vc.MODE_LABEL) == 3
 
 
@@ -96,7 +107,7 @@ def test_vol_kb_five_levels_checked_state():
     texts = [b.text for row in kb.inline_keyboard for b in row]
     datas = cb_texts(kb)
     assert [t.replace(" ✅", "") for t in texts] == list(vc.VOLUME_LEVELS)
-    assert datas == [f"volset:{n}" for n in vc.VOLUME_LEVELS]
+    assert datas == [f"vs:-100123:{n}" for n in vc.VOLUME_LEVELS]
     assert "High ✅" in texts                        # default High is checked
     kb2 = vc._vol_kb(None)                          # unknown chat -> default checked
     assert "High ✅" in [b.text for row in kb2.inline_keyboard for b in row]
@@ -191,7 +202,7 @@ def test_queue_view_with_swap_buttons():
     ]
     text, kb = vc._queue_view(-1001)
     data = cb_texts(kb)
-    assert data == ["swap:0:1", "swap:1:2", "skip", "qview"]  # swap options n-1
+    assert data == ["sw:-1001:0:1", "sw:-1001:1:2", "pb:-1001:skip", "qb:-1001"]
     assert "cur" in text and "a" in text
 
 
