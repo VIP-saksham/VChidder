@@ -732,6 +732,7 @@ async def _play_with_failover(chat_id, entry, mode):
 
 async def _all_in_one_audio(chat_id, path):
     """All-In-One: baaki assistants bhi same file same time bajayenge (sab se voice)."""
+    meta = QUEUE_META.setdefault(chat_id, {})
     await asyncio.sleep(2.5)   # primary ka stream pehle settle ho jaye
     for idx in range(1, len(ASSISTANTS)):
         eng = _engine_by_idx(idx)
@@ -741,6 +742,8 @@ async def _all_in_one_audio(chat_id, path):
             await _ensure_assistant_member(idx, chat_id)
             await eng.play(chat_id, MediaStream(path))
             PRESENCE_JOINED.add((chat_id, idx))
+            meta["eng"] = idx   # last started engine = active (controls isko target karein)
+            print(f"all-in-one asst#{idx}: VC joined + audio")
             await asyncio.sleep(1)
         except Exception as e:
             print(f"all-in-one asst#{idx} fail:", str(e)[:100])
@@ -1219,11 +1222,11 @@ async def pause_resume(_, m: Message):
         return await m.reply_text("❌ Nothing is playing")
     try:
         if m.command[0] == "pause":
-            await calls.pause(chat_id)
+            await _chat_engine(chat_id).pause(chat_id)
             paused_calls.add(chat_id)
             await m.reply_text("⏸ Paused")
         else:
-            await calls.resume(chat_id)
+            await _chat_engine(chat_id).resume(chat_id)
             paused_calls.discard(chat_id)
             await m.reply_text("▶️ Resumed")
     except Exception as e:
@@ -1631,7 +1634,7 @@ async def tts_cmd(_, m: Message):
     try:
         path = await _tts_file(text[:400], voice)
         gname = info.get("group") or CHAT_NAMES.get(chat_id) or str(chat_id)
-        await calls.play(chat_id, MediaStream(path))
+        await _chat_engine(chat_id).play(chat_id, MediaStream(path))
         # TTS ka end-signal — play ke baad reset (interrupt-noise discard)
         WAIT_END.setdefault(chat_id, _EndSignal()).reset()
         CHAT_NAMES[chat_id] = gname
@@ -1691,16 +1694,18 @@ async def mygroups_cb(_, cb: CallbackQuery):
     except Exception:
         pass
     if not buttons:
-        return await cb.message.edit_text(
+        return await _safe_edit(
+            cb,
             "❌ Assistant kisi group me nahi hai.\n"
             "Group ka link bhejo, ya assistant account ko group me add karo.",
-            reply_markup=_back_kb()
+            _back_kb(),
         )
     buttons.append([InlineKeyboardButton("⬅ Back", callback_data="backstart")])
-    await cb.message.edit_text(
+    await _safe_edit(
+        cb,
         "🔗 **Attach Group**\n\n"
         "Apna group tap karo — link bhejne ki zaroorat nahi 🚀",
-        reply_markup=InlineKeyboardMarkup(buttons)
+        InlineKeyboardMarkup(buttons),
     )
 
 
@@ -1716,31 +1721,47 @@ async def selg_cb(_, cb: CallbackQuery):
     except Exception:
         gname = CHAT_NAMES.get(chat_id, str(chat_id))
     user_data[uid] = {
-        "step": "audio",
+        "step": "mode",
         "group": gname,
         "chat_id": chat_id,
-        "invite": True
     }
     LAST_CHAT[uid] = chat_id
     CHAT_NAMES[chat_id] = gname
     await cb.message.edit_text(
         f"✅ **Group attached:** {gname}\n\n"
-        "🎵 Ab audio/video file ya link bhejo — turant play hoga"
+        "👥 **Kaunsa assistant mode?**",
+        reply_markup=_mode_kb(chat_id),
     )
-    await cb.answer("Attached! 🎵")
+    await cb.answer("Group attached — mode chuno")
+
+
+async def _safe_edit(cb, text, kb):
+    """Edit karo; fail (double-tap not-modified / None msg) ho to naya message bhejo.
+    Bina iske edit ka exception cb.answer tak nahi pahunchta -> button hamesha
+    'loading' dikhta hai (user: 'button click nahi ho raha')."""
+    try:
+        await cb.message.edit_text(text, reply_markup=kb)
+    except Exception:
+        try:
+            await cb.message.reply_text(text, reply_markup=kb)
+        except Exception:
+            pass
 
 
 @bot.on_callback_query(filters.regex("^cmds$"))
 async def cmds_cb(_, cb: CallbackQuery):
-    await cb.message.edit_text(CMDS_TEXT, reply_markup=_back_kb())
-    await cb.answer()
+    await _safe_edit(cb, CMDS_TEXT, _back_kb())
+    await cb.answer("📖 Commands")
 
 
 @bot.on_callback_query(filters.regex("^backstart$"))
 async def backstart_cb(_, cb: CallbackQuery):
-    name = cb.from_user.first_name or "Friend"
     if is_allowed(cb.from_user.id):
-        await cb.message.edit_text(_start_text(name), reply_markup=_start_kb())
+        await _safe_edit(
+            cb,
+            _start_text(cb.from_user.first_name or "Friend"),
+            _start_kb(),
+        )
     await cb.answer()
 
 
@@ -1983,11 +2004,13 @@ async def mode_cb(_, cb: CallbackQuery):
         info["step"] = "audio"
     gname = CHAT_NAMES.get(chat_id) or info.get("group") or str(chat_id)
     CHAT_NAMES[chat_id] = gname
-    await cb.message.edit_text(
+    await _safe_edit(
+        cb,
         f"✅ **Mode set:** {MODE_LABEL[mode]}\n"
         f"📻 **Group:** {gname}\n\n"
         "🎵 Ab audio/video file ya YT/direct link bhejo!\n"
-        "🔊 Volume: /vol"
+        "🔊 Volume: /vol",
+        None,
     )
     await cb.answer(f"{MODE_LABEL[mode]} ✓")
     await send_log(
@@ -2014,10 +2037,11 @@ async def checkjoin_cb(_, cb: CallbackQuery):
             INVITE_HASH[chat_id] = info["hash"]
         LAST_CHAT[uid] = chat_id
         CHAT_NAMES[chat_id] = user_data[uid].get("group") or str(chat_id)
-        await cb.message.edit_text(
+        await _safe_edit(
+            cb,
             f"✅ **Approved & Joined:** {user_data[uid].get('group', chat_id)}\n\n"
             "👥 **Kaunsa assistant mode?**",
-            reply_markup=_mode_kb(chat_id)
+            _mode_kb(chat_id),
         )
         await cb.answer("Joined! 🎉")
     else:
