@@ -163,7 +163,7 @@ def test_queue_worker_plays_then_skips_on_error(monkeypatch):
 
     async def run():
         cid = -100888
-        vc.WAIT_END[cid] = asyncio.Event()
+        vc.WAIT_END[cid] = vc._EndSignal()
         good1 = {"path": "tmp_g1", "title": "g1", "kind": "audio", "uid": 9, "group": "G"}
         bad = {"path": "tmp_bad", "title": "bad", "kind": "audio", "uid": 9, "group": "G"}
         good2 = {"path": "tmp_g2", "title": "g2", "kind": "audio", "uid": 9, "group": "G"}

@@ -162,7 +162,7 @@ paused_calls = set()
 QUEUES = {}          # chat id -> deque of entries
 QUEUE_META = {}      # chat id -> {current, mode, worker, extras, vol}
 QSEQ = [0]           # download naming counter
-WAIT_END = {}        # chat id -> asyncio.Event (stream end / skip signal)
+WAIT_END = {}        # chat id -> _EndSignal (stream end / skip signal)
 YT_CACHE = {}        # youtube url -> (path, title)
 DL_LOCKS = {}        # cache key -> asyncio.Lock (same-url dedupe)
 
@@ -519,6 +519,20 @@ async def _mic_keepalive_worker():
 
 # ---------------- queue engine ----------------
 
+class _EndSignal:
+    """Stable per-chat signal — inner event reset hota hai, object kabhi replace nahi."""
+    __slots__ = ("ev",)
+
+    def __init__(self):
+        self.ev = asyncio.Event()
+
+    def set(self):
+        self.ev.set()
+
+    def reset(self):
+        self.ev = asyncio.Event()
+
+
 def _drop_entry(entry):
     if not entry:
         return
@@ -537,7 +551,7 @@ async def _apply_volume(chat_id):
         return
     await asyncio.sleep(2)
     try:
-        await calls.change_volume_call(chat_id, vol)
+        await _chat_engine(chat_id).change_volume_call(chat_id, vol)
     except Exception as e:
         print("volume apply error:", str(e)[:100])
 
@@ -550,19 +564,13 @@ async def _queue_worker(chat_id):
             if not q:
                 break
             entry = q.popleft()
-            try:
-                await calls.play(chat_id, MediaStream(entry["path"]))
-            except Exception as e:
-                print("play error, skipping:", str(e)[:150])
-                try:
-                    await bot.send_message(
-                        entry["uid"],
-                        f"⏭ **{entry['title'][:32]}** skip hua:\n`{str(e)[:100]}`"
-                    )
-                except Exception:
-                    pass
+            # signal HAMESHA fresh reset ke sath — warna worker wait nahi karta (premature-left bug)
+            sig = WAIT_END.setdefault(chat_id, _EndSignal())
+            eng_idx = await _play_with_failover(chat_id, entry, meta.get("mode", MODE_SINGLE))
+            if eng_idx is None:
                 _drop_entry(entry)
                 continue
+            meta["eng"] = eng_idx
 
             meta["current"] = entry
             meta["pos"] = len(q) + 1
@@ -574,10 +582,9 @@ async def _queue_worker(chat_id):
             # assistant mode ke hisab se extra presence
             mode = meta.get("mode", MODE_SINGLE)
             if mode == MODE_ONBYONE and len(ASSISTANTS) > 1:
-                joined = [i for (c, i) in PRESENCE_JOINED if c == chat_id]
-                nxt = 1 + (max(joined) if joined else 0)
-                if nxt < len(ASSISTANTS):
-                    await _assistant_join(chat_id, nxt)
+                standby = eng_idx + 1
+                if standby < len(ASSISTANTS):
+                    await _assistant_join(chat_id, standby)
             elif mode == MODE_ALL:
                 for idx in range(1, len(ASSISTANTS)):
                     await _assistant_join(chat_id, idx)
@@ -609,16 +616,14 @@ async def _queue_worker(chat_id):
                 f"📻 Group: {entry.get('group', '?')}"
             )
 
-            # stream end / skip ka intezaar
-            ev = WAIT_END.get(chat_id)
-            if ev:
-                try:
-                    await asyncio.wait_for(ev.wait(), timeout=3600 * 6)
-                except asyncio.TimeoutError:
-                    pass
-                ev.clear()
-                if meta.get("stop"):
-                    break
+            # stream end / skip ka intezaar — play ke BAAD reset (stale-set bug)
+            sig.reset()
+            try:
+                await asyncio.wait_for(sig.ev.wait(), timeout=3600 * 6)
+            except asyncio.TimeoutError:
+                pass
+            if meta.get("stop"):
+                break
             _drop_entry(entry)
             meta["current"] = None
             await asyncio.sleep(1)
@@ -627,7 +632,7 @@ async def _queue_worker(chat_id):
     finally:
         WAIT_END.pop(chat_id, None)
         try:
-            await calls.leave_call(chat_id)
+            await _chat_engine(chat_id).leave_call(chat_id)
         except Exception:
             pass
         for idx in range(len(ASSISTANTS)):
@@ -644,6 +649,48 @@ async def _queue_worker(chat_id):
 
 def _presence_only_pairs():
     return {(c, i) for (c, i) in PRESENCE_JOINED if c in PRESENCE_ONLY}
+
+
+def _engine_by_idx(idx):
+    """Assistant index -> uska PyTgCalls engine (0 = primary)."""
+    if idx <= 0:
+        return calls
+    if idx < len(ASSISTANTS):
+        return ASSISTANTS[idx][2]
+    return None
+
+
+def _chat_engine(chat_id):
+    """Is chat ka active engine — failover ke baad assistant ho sakta hai."""
+    return _engine_by_idx(QUEUE_META.get(chat_id, {}).get("eng", 0)) or calls
+
+
+async def _play_with_failover(chat_id, entry, mode):
+    """Stream start karo. One-By-One me primary fail -> next assistants try karo.
+    Returns engine idx jo stream chala raha, ya None (sab fail)."""
+    order = list(range(len(ASSISTANTS))) if mode == MODE_ONBYONE else [0]
+    last = ""
+    for idx in order:
+        eng = _engine_by_idx(idx)
+        if eng is None:
+            continue
+        try:
+            if idx > 0:
+                await _ensure_assistant_member(idx, chat_id)
+            await eng.play(chat_id, MediaStream(entry["path"]))
+            return idx
+        except Exception as e:
+            last = str(e)[:120]
+            print(f"play fail asst#{idx}: {last}")
+    if last:
+        try:
+            await bot.send_message(
+                entry["uid"],
+                f"⏭ **{entry['title'][:32]}** skip hua:\n`{last}`"
+            )
+        except Exception:
+            pass
+    return None
 
 
 def _enqueue(chat_id, entry):
@@ -1427,7 +1474,7 @@ async def replay(_, cb: CallbackQuery):
     if not cur or not os.path.exists(cur["path"]):
         return await cb.answer("File missing — dobara bhejo", show_alert=True)
     try:
-        await calls.play(chat_id, MediaStream(cur["path"]))
+        await _chat_engine(chat_id).play(chat_id, MediaStream(cur["path"]))
         paused_calls.discard(chat_id)
         await cb.answer("⟲ Replaying")
     except Exception as e:
@@ -1509,8 +1556,9 @@ async def tts_cmd(_, m: Message):
     try:
         path = await _tts_file(text[:400], voice)
         gname = info.get("group") or CHAT_NAMES.get(chat_id) or str(chat_id)
-        WAIT_END.setdefault(chat_id, asyncio.Event())
         await calls.play(chat_id, MediaStream(path))
+        # TTS ka end-signal — play ke baad reset (interrupt-noise discard)
+        WAIT_END.setdefault(chat_id, _EndSignal()).reset()
         CHAT_NAMES[chat_id] = gname
         asyncio.ensure_future(_apply_volume(chat_id))
         await msg.reply_voice(path)
@@ -2054,7 +2102,6 @@ async def _start_primary():
             me = await userbot.get_me()
             print(f"✅ Promoted to primary: {me.first_name} ({me.id})")
             calls = PyTgCalls(userbot)
-            await calls.start()
             # promoted session ko saved list se hata do (ab wo .env wala hai)
             saved.pop(i)
             with open(SESSIONS_FILE, "w") as f:
@@ -2084,6 +2131,8 @@ async def main():
     ASSISTANTS.append(
         (f"{ub.first_name} (@{ub.username or ub.id})", userbot, calls)
     )
+    await calls.start()
+    print("✅ PyTgCalls started")
     print(f"👑 Owner: {OWNER_ID} | 🛡 Sudo: {sorted(SUDO_IDS)} | ✅ Approved: {len(APPROVED)}")
 
     if SESSION_STRING != os.getenv("SESSION_STRING", "").strip():
