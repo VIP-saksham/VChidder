@@ -6,5 +6,5 @@ while screen -ls 2>/dev/null | grep -q '\.vchidder'; do
   sleep 0.3
 done
 rm -f log.txt
-screen -dmS vchidder bash -c 'export PYTHONUNBUFFERED=1; exec venv/bin/python Vc.py >> log.txt 2>&1'
+screen -dmS vchidder bash -c "export PYTHONUNBUFFERED=1; exec $PWD/venv/bin/python $PWD/Vc.py >> $PWD/log.txt 2>&1"
 echo "LAUNCHED — logs: tail -f log.txt"
